@@ -16,14 +16,14 @@ dependencies:
   - py-opencv=4.7
   - ipykernel=6.23
   - matplotlib=3.7
-  - av=10.0
+  - av=10.0.0
   - k3d=2.15
   - pyyaml=6.0
   - tqdm=4.65
   - zarr=2.16
   - numcodecs=0.11
   - hydra-core=1.2.0
-  - wandb=0.15.8
+  - wandb=0.26.1
   - dill=0.3.7
   - einops=0.6.1
   - diffusers=0.18.2
@@ -57,3 +57,4 @@ dependencies:
     - robosuite @ https://github.com/cheng-chi/robosuite/archive/3f2c3116f1c0a1916e94bfa28da4d055927d1ab3.tar.gz
     # implicitly depend on conda package exiftool
     - PyExifTool==0.5
+    - huggingface_hub==0.25.0
