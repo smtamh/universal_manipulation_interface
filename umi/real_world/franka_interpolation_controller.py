@@ -20,6 +20,7 @@ class Command(enum.Enum):
     STOP = 0
     SERVOL = 1
     SCHEDULE_WAYPOINT = 2
+    MOVEJ = 3
 
 tx_flangerot90_tip = np.identity(4)
 tx_flangerot90_tip[:3, 3] = np.array([-0.0336, 0, 0.247])
@@ -121,6 +122,7 @@ class FrankaInterpolationController(mp.Process):
         example = {
             'cmd': Command.SERVOL.value,
             'target_pose': np.zeros((6,), dtype=np.float64),
+            'target_joints': np.zeros((7,), dtype=np.float64),
             'duration': 0.0,
             'target_time': 0.0
         }
@@ -218,6 +220,19 @@ class FrankaInterpolationController(mp.Process):
             'cmd': Command.SCHEDULE_WAYPOINT.value,
             'target_pose': pose,
             'target_time': target_time
+        }
+        self.input_queue.put(message)
+
+    def moveJ(self, joints, duration=3.0):
+        assert self.is_alive()
+        assert duration > 0
+        joints = np.asarray(joints, dtype=np.float64)
+        assert joints.shape == (7,)
+
+        message = {
+            'cmd': Command.MOVEJ.value,
+            'target_joints': joints,
+            'duration': duration
         }
         self.input_queue.put(message)
     
@@ -349,6 +364,25 @@ class FrankaInterpolationController(mp.Process):
                             last_waypoint_time=last_waypoint_time
                         )
                         last_waypoint_time = target_time
+                    elif cmd == Command.MOVEJ.value:
+                        target_joints = np.asarray(command['target_joints'], dtype=np.float64)
+                        duration = float(command['duration'])
+                        robot.terminate_current_policy()
+                        robot.move_to_joint_positions(
+                            positions=target_joints,
+                            time_to_go=duration
+                        )
+                        curr_pose = robot.get_ee_pose()
+                        curr_time = time.monotonic()
+                        last_waypoint_time = curr_time
+                        pose_interp = PoseTrajectoryInterpolator(
+                            times=[curr_time],
+                            poses=[curr_pose]
+                        )
+                        robot.start_cartesian_impedance(
+                            Kx=self.Kx,
+                            Kxd=self.Kxd
+                        )
                     else:
                         keep_running = False
                         break
