@@ -26,6 +26,7 @@ class MultiUvcCamera:
             vis_transform: Optional[Union[Callable[[Dict], Dict], List[Callable]]]=None,
             recording_transform: Optional[Union[Callable[[Dict], Dict], List[Callable]]]=None,
             video_recorder: Optional[Union[VideoRecorder, List[VideoRecorder]]]=None,
+            decode_raw_yuv=False,
             verbose=False
         ):
         super().__init__()
@@ -49,6 +50,8 @@ class MultiUvcCamera:
             recording_transform, n_cameras, Callable)
         video_recorder = repeat_to_list(
             video_recorder, n_cameras, VideoRecorder)
+        decode_raw_yuv = repeat_to_list(
+            decode_raw_yuv, n_cameras, bool)
         
         cameras = dict()
         for i, path in enumerate(dev_video_paths):
@@ -66,6 +69,7 @@ class MultiUvcCamera:
                 vis_transform=vis_transform[i],
                 recording_transform=recording_transform[i],
                 video_recorder=video_recorder[i],
+                decode_raw_yuv=decode_raw_yuv[i],
                 verbose=verbose
             )
 
@@ -113,7 +117,7 @@ class MultiUvcCamera:
 
     def stop_wait(self):
         for camera in self.cameras.values():
-            camera.join()
+            camera.end_wait()
 
     def get(self, k=None, out=None) -> Dict[int, Dict[str, np.ndarray]]:
         """

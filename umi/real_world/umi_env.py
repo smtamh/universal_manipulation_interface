@@ -50,6 +50,7 @@ class UmiEnv:
             obs_float32=False,
             camera_paths=DEFAULT_CAMERA_PATHS,
             camera_reorder=None,
+            camera_decode_raw_yuv=True,
             no_mirror=False,
             fisheye_converter=None,
             mirror_crop=False,
@@ -233,6 +234,7 @@ class UmiEnv:
             transform=transform,
             vis_transform=vis_transform,
             video_recorder=video_recorder,
+            decode_raw_yuv=camera_decode_raw_yuv,
             verbose=False
         )
 

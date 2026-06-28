@@ -44,6 +44,7 @@ class UvcCamera(mp.Process):
             vis_transform: Optional[Callable[[Dict], Dict]] = None,
             recording_transform: Optional[Callable[[Dict], Dict]] = None,
             video_recorder: Optional[VideoRecorder] = None,
+            decode_raw_yuv=False,
             verbose=False
         ):
         super().__init__()
@@ -118,6 +119,7 @@ class UvcCamera(mp.Process):
         self.vis_transform = vis_transform
         self.recording_transform = recording_transform
         self.video_recorder = video_recorder
+        self.decode_raw_yuv = decode_raw_yuv
         self.verbose = verbose
         self.put_start_time = None
         self.num_threads = num_threads
@@ -128,6 +130,9 @@ class UvcCamera(mp.Process):
         self.ring_buffer = ring_buffer
         self.vis_ring_buffer = vis_ring_buffer
         self.command_queue = command_queue
+
+        self.launch_timeout = 10.0
+        self.retry_interval = 0.25
 
     # ========= context manager ===========
     def __enter__(self):
@@ -157,11 +162,26 @@ class UvcCamera(mp.Process):
             self.end_wait()
 
     def start_wait(self):
-        self.ready_event.wait()
-        self.video_recorder.start_wait()
+        deadline = time.monotonic() + self.launch_timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f'UvcCamera {self.dev_video_path} failed to become ready within {self.launch_timeout}s'
+                )
+            if self.ready_event.wait(timeout=min(0.1, remaining)):
+                self.video_recorder.start_wait()
+                return
+            if not self.is_alive():
+                raise RuntimeError(
+                    f'UvcCamera {self.dev_video_path} exited before becoming ready'
+                )
     
     def end_wait(self):
-        self.join()
+        self.join(timeout=self.launch_timeout)
+        if self.is_alive():
+            self.terminate()
+            self.join(timeout=1.0)
         self.video_recorder.end_wait()
 
     @property
@@ -204,18 +224,12 @@ class UvcCamera(mp.Process):
         threadpool_limits(self.num_threads)
         cv2.setNumThreads(self.num_threads)
 
-        # open VideoCapture
-        cap = cv2.VideoCapture(self.dev_video_path, cv2.CAP_V4L2)
+        cap = None
         
         try:
             # set resolution and fps
             w, h = self.resolution
             fps = self.capture_fps
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-            # set fps
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, self.cap_buffer_size)
-            cap.set(cv2.CAP_PROP_FPS, fps)
 
             # put frequency regulation
             put_idx = None
@@ -226,23 +240,76 @@ class UvcCamera(mp.Process):
             # reuse frame buffer
             iter_idx = 0
             t_start = time.time()
+            startup_deadline = time.monotonic() + self.launch_timeout
+            logged_open = False
             while not self.stop_event.is_set():
-                ts = time.time()
+                if cap is None:
+                    if self.verbose and not logged_open:
+                        print(
+                            f'[UvcCamera] opening {self.dev_video_path} at {w}x{h}@{fps}',
+                            flush=True
+                        )
+                        logged_open = True
+                    cap = cv2.VideoCapture(self.dev_video_path, cv2.CAP_V4L2)
+                    if self.decode_raw_yuv:
+                        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, self.cap_buffer_size)
+                    cap.set(cv2.CAP_PROP_FPS, fps)
+                    if not cap.isOpened():
+                        cap.release()
+                        cap = None
+                        if not self.ready_event.is_set() and time.monotonic() >= startup_deadline:
+                            raise RuntimeError(
+                                f'Failed to open {self.dev_video_path} via OpenCV/V4L2 '
+                                f'at {w}x{h}@{fps}'
+                            )
+                        time.sleep(self.retry_interval)
+                        continue
+
                 ret = cap.grab()
-                assert ret
+                if not ret:
+                    cap.release()
+                    cap = None
+                    if not self.ready_event.is_set() and time.monotonic() >= startup_deadline:
+                        raise RuntimeError(
+                            f'Failed to grab an initial frame from {self.dev_video_path} '
+                            f'within {self.launch_timeout}s'
+                        )
+                    time.sleep(self.retry_interval)
+                    continue
                 
-                # directly write into shared memory to avoid copy
-                frame = self.video_recorder.get_img_buffer()
-                ret, frame = cap.retrieve(frame)
+                ret, raw = cap.retrieve()
                 t_recv = time.time()
-                assert ret
+                if not ret:
+                    cap.release()
+                    cap = None
+                    if not self.ready_event.is_set() and time.monotonic() >= startup_deadline:
+                        raise RuntimeError(
+                            f'Failed to retrieve an initial frame from {self.dev_video_path} '
+                            f'within {self.launch_timeout}s'
+                        )
+                    time.sleep(self.retry_interval)
+                    continue
+
+                frame = raw
+                if self.decode_raw_yuv:
+                    if raw.ndim == 2:
+                        raw = raw.reshape(raw.shape[0], raw.shape[1] // 2, 2)
+                    if raw.ndim == 3 and raw.shape[2] == 2:
+                        frame = cv2.cvtColor(raw, cv2.COLOR_YUV2BGR_YUYV)
+                        if frame.mean() == 0 and raw.mean() > 0:
+                            frame = cv2.cvtColor(raw, cv2.COLOR_YUV2BGR_UYVY)
                 mt_cap = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
                 t_cap = mt_cap - time.monotonic() + time.time()
                 t_cal = t_recv - self.receive_latency # calibrated latency
                      
                 # record frame
                 if self.video_recorder.is_ready():
-                    self.video_recorder.write_img_buffer(frame, frame_time=t_cal)
+                    rec_frame = self.video_recorder.get_img_buffer()
+                    np.copyto(rec_frame, frame)
+                    self.video_recorder.write_img_buffer(rec_frame, frame_time=t_cal)
 
                 data = dict()
                 data['camera_receive_timestamp'] = t_recv
@@ -282,6 +349,8 @@ class UvcCamera(mp.Process):
                 # signal ready
                 if iter_idx == 0:
                     self.ready_event.set()
+                    if self.verbose:
+                        print(f'[UvcCamera] ready {self.dev_video_path}', flush=True)
                     
                 # put to vis
                 vis_data = data
@@ -329,5 +398,6 @@ class UvcCamera(mp.Process):
         finally:
             self.video_recorder.stop()
             # When everything done, release the capture
-            cap.release()
+            if cap is not None:
+                cap.release()
 
