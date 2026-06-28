@@ -8,6 +8,7 @@ import cv2
 from multiprocessing.managers import SharedMemoryManager
 from umi.real_world.rtde_interpolation_controller import RTDEInterpolationController
 from umi.real_world.wsg_controller import WSGController
+from umi.real_world.dyros_gripper_controller import DYROSController
 from umi.real_world.franka_interpolation_controller import FrankaInterpolationController
 from umi.real_world.multi_uvc_camera import MultiUvcCamera, VideoRecorder
 from diffusion_policy.common.timestamp_accumulator import (
@@ -27,6 +28,11 @@ from umi.common.pose_util import pose_to_pos_rot
 from umi.common.interpolation_util import get_interp1d, PoseInterpolator
 
 
+DEFAULT_CAMERA_PATHS = (
+    '/dev/v4l/by-id/usb-Elgato_Elgato_HD60_X_A00XB34322RCJG-video-index0',
+)
+
+
 class UmiEnv:
     def __init__(self, 
             # required params
@@ -37,10 +43,12 @@ class UmiEnv:
             # env params
             frequency=20,
             robot_type='ur5',
+            gripper_type='dyros',
             # obs
             obs_image_resolution=(224,224),
             max_obs_buffer_size=60,
             obs_float32=False,
+            camera_paths=DEFAULT_CAMERA_PATHS,
             camera_reorder=None,
             no_mirror=False,
             fisheye_converter=None,
@@ -69,6 +77,7 @@ class UmiEnv:
             # robot
             tcp_offset=0.21,
             init_joints=False,
+            gripper_home_to_open=False,
             # vis params
             enable_multi_cam_vis=True,
             multi_cam_vis_resolution=(960, 960),
@@ -91,12 +100,25 @@ class UmiEnv:
         # Required to workaround a firmware bug.
         reset_all_elgato_devices()
 
-        # Wait for all v4l cameras to be back online
-        time.sleep(0.1)
-        v4l_paths = get_sorted_v4l_paths()
-        if camera_reorder is not None:
-            paths = [v4l_paths[i] for i in camera_reorder]
-            v4l_paths = paths
+        if camera_paths is None:
+            v4l_paths = get_sorted_v4l_paths()
+            if camera_reorder is not None:
+                v4l_paths = [v4l_paths[i] for i in camera_reorder]
+        else:
+            v4l_paths = [str(pathlib.Path(x).expanduser()) for x in camera_paths]
+
+        camera_reset_timeout = 10.0
+        camera_reset_settle_time = 2.0
+        wait_deadline = time.monotonic() + camera_reset_timeout
+        while True:
+            missing_paths = [path for path in v4l_paths if not pathlib.Path(path).exists()]
+            if not missing_paths:
+                break
+            if time.monotonic() >= wait_deadline:
+                missing = ', '.join(missing_paths)
+                raise RuntimeError(f'Timed out waiting for cameras to reappear: {missing}')
+            time.sleep(0.1)
+        time.sleep(camera_reset_settle_time)
 
         # compute resolution for vis
         rw, rh, col, row = optimal_row_cols(
@@ -182,7 +204,7 @@ class UmiEnv:
             video_recorder.append(VideoRecorder.create_hevc_nvenc(
                 fps=fps,
                 input_pix_fmt='bgr24',
-                bit_rate=bit_rate
+                # bit_rate=bit_rate
             ))
 
             def vis_tf(data, input_res=res):
@@ -259,13 +281,23 @@ class UmiEnv:
                 receive_latency=robot_obs_latency
             )
         
-        gripper = WSGController(
-            shm_manager=shm_manager,
-            hostname=gripper_ip,
-            port=gripper_port,
-            receive_latency=gripper_obs_latency,
-            use_meters=True
-        )
+        if gripper_type == 'dyros':
+            gripper = DYROSController(
+                shm_manager=shm_manager,
+                receive_latency=gripper_obs_latency,
+                use_meters=True,
+                home_to_open=gripper_home_to_open
+            )
+        elif gripper_type == 'wsg':
+            gripper = WSGController(
+                shm_manager=shm_manager,
+                hostname=gripper_ip,
+                port=gripper_port,
+                receive_latency=gripper_obs_latency,
+                use_meters=True
+            )
+        else:
+            raise ValueError(f'Unsupported gripper_type: {gripper_type}')
 
         self.camera = camera
         self.robot = robot
@@ -307,13 +339,56 @@ class UmiEnv:
         return self.camera.is_ready and self.robot.is_ready and self.gripper.is_ready
     
     def start(self, wait=True):
-        self.camera.start(wait=False)
-        self.gripper.start(wait=False)
-        self.robot.start(wait=False)
-        if self.multi_cam_vis is not None:
-            self.multi_cam_vis.start(wait=False)
-        if wait:
-            self.start_wait()
+        started_camera = False
+        started_gripper = False
+        started_robot = False
+        started_multi_cam_vis = False
+
+        try:
+            print('[UmiEnv] starting camera', flush=True)
+            self.camera.start(wait=False)
+            started_camera = True
+            if wait:
+                print('[UmiEnv] waiting for camera readiness', flush=True)
+                self.camera.start_wait()
+                print('[UmiEnv] camera ready', flush=True)
+
+            print('[UmiEnv] starting gripper', flush=True)
+            self.gripper.start(wait=False)
+            started_gripper = True
+
+            print('[UmiEnv] starting robot', flush=True)
+            self.robot.start(wait=False)
+            started_robot = True
+
+            if self.multi_cam_vis is not None:
+                print('[UmiEnv] starting multi-camera visualizer', flush=True)
+                self.multi_cam_vis.start(wait=False)
+                started_multi_cam_vis = True
+
+            if wait:
+                print('[UmiEnv] waiting for gripper readiness', flush=True)
+                self.gripper.start_wait()
+                print('[UmiEnv] gripper ready', flush=True)
+
+                print('[UmiEnv] waiting for robot readiness', flush=True)
+                self.robot.start_wait()
+                print('[UmiEnv] robot ready', flush=True)
+
+                if self.multi_cam_vis is not None:
+                    print('[UmiEnv] waiting for multi-camera visualizer readiness', flush=True)
+                    self.multi_cam_vis.start_wait()
+                    print('[UmiEnv] multi-camera visualizer ready', flush=True)
+        except Exception:
+            if started_multi_cam_vis:
+                self.multi_cam_vis.stop(wait=True)
+            if started_robot:
+                self.robot.stop(wait=True)
+            if started_gripper:
+                self.gripper.stop(wait=True)
+            if started_camera:
+                self.camera.stop(wait=True)
+            raise
 
     def stop(self, wait=True):
         self.end_episode()
@@ -357,8 +432,16 @@ class UmiEnv:
         """
 
         "observation dict"
-        assert self.is_ready
-
+        if not self.is_ready:
+            print(
+                "[UmiEnv] not ready | "
+                f"camera={self.camera.is_ready}, "
+                f"robot={self.robot.is_ready}, "
+                f"gripper={self.gripper.is_ready}",
+                flush=True
+            )
+            raise RuntimeError("UmiEnv is not ready")
+        
         # get data
         # 60 Hz, camera_calibrated_timestamp
         k = math.ceil(
@@ -485,6 +568,9 @@ class UmiEnv:
     def get_robot_state(self):
         return self.robot.get_state()
 
+    def get_gripper_state(self):
+        return self.gripper.get_state()
+
     # recording API
     def start_episode(self, start_time=None):
         "Start recording and return first obs"
@@ -518,7 +604,15 @@ class UmiEnv:
     
     def end_episode(self):
         "Stop recording"
-        assert self.is_ready
+        if not self.is_ready:
+            print(
+                "[UmiEnv] end_episode skipped because env is not ready | "
+                f"camera={self.camera.is_ready}, "
+                f"robot={self.robot.is_ready}, "
+                f"gripper={self.gripper.is_ready}",
+                flush=True
+            )
+            return
         
         # stop video recorder
         self.camera.stop_recording()
