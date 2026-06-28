@@ -8,7 +8,7 @@ import scipy.spatial.transform as st
 import numpy as np
 
 from umi.shared_memory.shared_memory_queue import (
-    SharedMemoryQueue, Empty)
+    SharedMemoryQueue, Empty, Full)
 from umi.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
 from umi.common.pose_trajectory_interpolator import PoseTrajectoryInterpolator
 from diffusion_policy.common.precise_sleep import precise_wait
@@ -67,6 +67,10 @@ class FrankaInterface:
 
     def close(self):
         self.server.close()
+
+
+def _is_no_controller_running_error(exc: Exception) -> bool:
+    return 'no controller running' in str(exc).lower()
 
 
 class FrankaInterpolationController(mp.Process):
@@ -159,6 +163,16 @@ class FrankaInterpolationController(mp.Process):
         self.input_queue = input_queue
         self.ring_buffer = ring_buffer
         self.receive_keys = receive_keys
+
+    def _read_robot_state(self, robot):
+        state = dict()
+        for key, func_name in self.receive_keys:
+            state[key] = getattr(robot, func_name)()
+
+        t_recv = time.time()
+        state['robot_receive_timestamp'] = t_recv
+        state['robot_timestamp'] = t_recv - self.receive_latency
+        return state
             
     # ========= launch method ===========
     def start(self, wait=True):
@@ -169,10 +183,15 @@ class FrankaInterpolationController(mp.Process):
             print(f"[FrankaPositionalController] Controller process spawned at {self.pid}")
 
     def stop(self, wait=True):
-        message = {
-            'cmd': Command.STOP.value
-        }
-        self.input_queue.put(message)
+        if self.is_alive():
+            message = {
+                'cmd': Command.STOP.value
+            }
+            try:
+                self.input_queue.put(message)
+            except Full:
+                self.input_queue.clear()
+                self.input_queue.put(message)
         if wait:
             self.stop_wait()
 
@@ -210,9 +229,14 @@ class FrankaInterpolationController(mp.Process):
             'target_pose': pose,
             'duration': duration
         }
-        self.input_queue.put(message)
+        try:
+            self.input_queue.put(message)
+        except Full:
+            self.input_queue.clear()
+            self.input_queue.put(message)
     
     def schedule_waypoint(self, pose, target_time):
+        assert self.is_alive()
         pose = np.array(pose)
         assert pose.shape == (6,)
 
@@ -221,7 +245,13 @@ class FrankaInterpolationController(mp.Process):
             'target_pose': pose,
             'target_time': target_time
         }
-        self.input_queue.put(message)
+        try:
+            self.input_queue.put(message)
+        except Full:
+            # Waypoints are time-sensitive; if we fall behind, drop the stale backlog
+            # and keep the newest target rather than crashing the replay loop.
+            self.input_queue.clear()
+            self.input_queue.put(message)
 
     def moveJ(self, joints, duration=3.0):
         assert self.is_alive()
@@ -234,6 +264,7 @@ class FrankaInterpolationController(mp.Process):
             'target_joints': joints,
             'duration': duration
         }
+        self.input_queue.clear()
         self.input_queue.put(message)
     
     # ========= receive APIs =============
@@ -299,17 +330,19 @@ class FrankaInterpolationController(mp.Process):
                 flange_pose = mat_to_pose(pose_to_mat(tip_pose) @ tx_tip_flange)
 
                 # send command to robot
-                robot.update_desired_ee_pose(flange_pose)
+                try:
+                    robot.update_desired_ee_pose(flange_pose)
+                except Exception as exc:
+                    if not _is_no_controller_running_error(exc):
+                        raise
+                    robot.start_cartesian_impedance(
+                        Kx=self.Kx,
+                        Kxd=self.Kxd
+                    )
+                    robot.update_desired_ee_pose(flange_pose)
 
                 # update robot state
-                state = dict()
-                for key, func_name in self.receive_keys:
-                    state[key] = getattr(robot, func_name)()
-
-                    
-                t_recv = time.time()
-                state['robot_receive_timestamp'] = t_recv
-                state['robot_timestamp'] = t_recv - self.receive_latency
+                state = self._read_robot_state(robot)
                 self.ring_buffer.put(state)
 
                 # fetch command from queue
@@ -367,7 +400,11 @@ class FrankaInterpolationController(mp.Process):
                     elif cmd == Command.MOVEJ.value:
                         target_joints = np.asarray(command['target_joints'], dtype=np.float64)
                         duration = float(command['duration'])
-                        robot.terminate_current_policy()
+                        try:
+                            robot.terminate_current_policy()
+                        except Exception as exc:
+                            if not _is_no_controller_running_error(exc):
+                                raise
                         robot.move_to_joint_positions(
                             positions=target_joints,
                             time_to_go=duration
@@ -403,7 +440,11 @@ class FrankaInterpolationController(mp.Process):
             # manditory cleanup
             # terminate
             print('\n\n\n\nterminate_current_policy\n\n\n\n\n')
-            robot.terminate_current_policy()
+            try:
+                robot.terminate_current_policy()
+            except Exception as exc:
+                if not _is_no_controller_running_error(exc):
+                    raise
             del robot
             self.ready_event.set()
 
