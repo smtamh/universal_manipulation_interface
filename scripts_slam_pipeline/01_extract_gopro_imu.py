@@ -17,13 +17,24 @@ import multiprocessing
 import concurrent.futures
 from tqdm import tqdm
 
+SCALE_CAL_PREFIX = 'scale_calibration_'
+
+
+def _iter_video_dirs(input_dir: pathlib.Path, include_scale_calibration: bool = False):
+    video_dirs = [x.parent for x in input_dir.glob('*/raw_video.mp4')]
+    if include_scale_calibration:
+        return video_dirs
+    return [x for x in video_dirs if not x.name.startswith(SCALE_CAL_PREFIX)]
+
+
 # %%
 @click.command()
 @click.option('-d', '--docker_image', default="chicheng/openicc:latest")
 @click.option('-n', '--num_workers', type=int, default=None)
 @click.option('-np', '--no_docker_pull', is_flag=True, default=False, help="pull docker image from docker hub")
+@click.option('--include_scale_calibration', is_flag=True, default=False, help='Also process demos/scale_calibration_* videos.')
 @click.argument('session_dir', nargs=-1)
-def main(docker_image, num_workers, no_docker_pull, session_dir):
+def main(docker_image, num_workers, no_docker_pull, include_scale_calibration, session_dir):
     if num_workers is None:
         num_workers = multiprocessing.cpu_count()
 
@@ -42,7 +53,7 @@ def main(docker_image, num_workers, no_docker_pull, session_dir):
 
     for session in session_dir:
         input_dir = pathlib.Path(os.path.expanduser(session)).joinpath('demos')
-        input_video_dirs = [x.parent for x in input_dir.glob('*/raw_video.mp4')]
+        input_video_dirs = _iter_video_dirs(input_dir, include_scale_calibration=include_scale_calibration)
         print(f'Found {len(input_video_dirs)} video dirs')
 
         with tqdm(total=len(input_video_dirs)) as pbar:
@@ -77,15 +88,15 @@ def main(docker_image, num_workers, no_docker_pull, session_dir):
 
                     if len(futures) >= num_workers:
                         # limit number of inflight tasks
-                        completed, futures = concurrent.futures.wait(futures, 
+                        completed, futures = concurrent.futures.wait(futures,
                             return_when=concurrent.futures.FIRST_COMPLETED)
                         pbar.update(len(completed))
 
                     futures.add(executor.submit(
-                        lambda x, stdo, stde: subprocess.run(x, 
+                        lambda x, stdo, stde: subprocess.run(x,
                             cwd=str(video_dir),
                             stdout=stdo.open('w'),
-                            stderr=stde.open('w')), 
+                            stderr=stde.open('w')),
                         cmd, stdout_path, stderr_path))
                     # print(' '.join(cmd))
 

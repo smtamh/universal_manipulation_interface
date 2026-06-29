@@ -16,6 +16,25 @@ import shutil
 from exiftool import ExifToolHelper
 from umi.common.timecode_util import mp4_get_start_datetime
 
+
+IGNORED_RAW_VIDEO_DIR_PREFIXES = (
+    'scale_calibration',
+)
+
+
+def _is_ignored_raw_video_path(input_dir: pathlib.Path, mp4_path: pathlib.Path) -> bool:
+    rel_parts = mp4_path.relative_to(input_dir).parts[:-1]
+    for part in rel_parts:
+        if any(part.startswith(prefix) for prefix in IGNORED_RAW_VIDEO_DIR_PREFIXES):
+            return True
+    return False
+
+
+def _iter_input_mp4_paths(input_dir: pathlib.Path):
+    mp4_paths = list(input_dir.glob('**/*.MP4')) + list(input_dir.glob('**/*.mp4'))
+    return [path for path in mp4_paths if not _is_ignored_raw_video_path(input_dir, path)]
+
+
 # %%
 @click.command(help='Session directories. Assumming mp4 videos are in <session_dir>/raw_videos')
 @click.argument('session_dir', nargs=-1)
@@ -35,16 +54,23 @@ def main(session_dir):
                 shutil.move(mp4_path, out_path)
         
         # create mapping video if don't exist
-        mapping_vid_path = input_dir.joinpath('mapping.mp4')
-        if (not mapping_vid_path.exists()) and not(mapping_vid_path.is_symlink()):
+        mapping_candidates = [
+            input_dir.joinpath('mapping.mp4'),
+            input_dir.joinpath('mapping.MP4'),
+        ]
+        has_mapping_video = any(p.exists() or p.is_symlink() for p in mapping_candidates)
+        if not has_mapping_video:
+            target_mapping_path = input_dir.joinpath('mapping.mp4')
             max_size = -1
             max_path = None
-            for mp4_path in list(input_dir.glob('**/*.MP4')) + list(input_dir.glob('**/*.mp4')):
+            for mp4_path in _iter_input_mp4_paths(input_dir):
                 size = mp4_path.stat().st_size
                 if size > max_size:
                     max_size = size
                     max_path = mp4_path
-            shutil.move(max_path, mapping_vid_path)
+            if max_path is None:
+                raise RuntimeError(f'No eligible mp4 found under {input_dir} to use as mapping.mp4')
+            shutil.move(max_path, target_mapping_path)
             print(f"raw_videos/mapping.mp4 don't exist! Renaming largest file {max_path.name}.")
         
         # create gripper calibration video if don't exist
@@ -56,7 +82,7 @@ def main(session_dir):
             serial_start_dict = dict()
             serial_path_dict = dict()
             with ExifToolHelper() as et:
-                for mp4_path in list(input_dir.glob('**/*.MP4')) + list(input_dir.glob('**/*.mp4')):
+                for mp4_path in _iter_input_mp4_paths(input_dir):
                     if mp4_path.name.startswith('map'):
                         continue
                     
@@ -78,8 +104,8 @@ def main(session_dir):
                 shutil.move(path, out_path)
 
         # look for mp4 video in all subdirectories in input_dir
-        input_mp4_paths = list(input_dir.glob('**/*.MP4')) + list(input_dir.glob('**/*.mp4'))
-        print(f'Found {len(input_mp4_paths)} MP4 videos')
+        input_mp4_paths = _iter_input_mp4_paths(input_dir)
+        print(f'Found {len(input_mp4_paths)} eligible MP4 videos')
 
         with ExifToolHelper() as et:
             for mp4_path in input_mp4_paths:
@@ -111,7 +137,7 @@ def main(session_dir):
                 # relative_to's walk_up argument is not avaliable until python 3.12
                 dots = os.path.join(*['..'] * len(mp4_path.parent.relative_to(session).parts))
                 rel_path = str(out_video_path.relative_to(session))
-                symlink_path = os.path.join(dots, rel_path)                
+                symlink_path = os.path.join(dots, rel_path)
                 mp4_path.symlink_to(symlink_path)
 
 # %%

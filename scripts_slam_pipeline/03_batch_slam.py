@@ -21,11 +21,21 @@ import av
 import numpy as np
 from umi.common.cv_util import draw_predefined_mask
 
+SCALE_CAL_PREFIX = 'scale_calibration_'
+
+
+def _iter_video_dirs(input_dir: pathlib.Path, include_scale_calibration: bool = False):
+    video_dirs = [x.parent for x in input_dir.glob('demo*/raw_video.mp4')]
+    video_dirs += [x.parent for x in input_dir.glob('map*/raw_video.mp4')]
+    if include_scale_calibration:
+        video_dirs += [x.parent for x in input_dir.glob(f'{SCALE_CAL_PREFIX}*/raw_video.mp4')]
+    return sorted(video_dirs)
+
 
 # %%
 def runner(cmd, cwd, stdout_path, stderr_path, timeout, **kwargs):
     try:
-        return subprocess.run(cmd,                       
+        return subprocess.run(cmd,
             cwd=str(cwd),
             stdout=stdout_path.open('w'),
             stderr=stderr_path.open('w'),
@@ -44,12 +54,12 @@ def runner(cmd, cwd, stdout_path, stderr_path, timeout, **kwargs):
 @click.option('-ml', '--max_lost_frames', type=int, default=60)
 @click.option('-tm', '--timeout_multiple', type=float, default=16, help='timeout_multiple * duration = timeout')
 @click.option('-np', '--no_docker_pull', is_flag=True, default=False, help="pull docker image from docker hub")
-def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeout_multiple, no_docker_pull):
+@click.option('--include_scale_calibration', is_flag=True, default=False, help='Also process demos/scale_calibration_* videos.')
+def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeout_multiple, no_docker_pull, include_scale_calibration):
     input_dir = pathlib.Path(os.path.expanduser(input_dir)).absolute()
-    input_video_dirs = [x.parent for x in input_dir.glob('demo*/raw_video.mp4')]
-    input_video_dirs += [x.parent for x in input_dir.glob('map*/raw_video.mp4')]
+    input_video_dirs = _iter_video_dirs(input_dir, include_scale_calibration=include_scale_calibration)
     print(f'Found {len(input_video_dirs)} video dirs')
-    
+
     if map_path is None:
         map_path = input_dir.joinpath('mapping', 'map_atlas.osa')
     else:
@@ -81,7 +91,7 @@ def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeou
                 if video_dir.joinpath('camera_trajectory.csv').is_file():
                     print(f"camera_trajectory.csv already exists, skipping {video_dir.name}")
                     continue
-                
+
                 # softlink won't work in bind volume
                 mount_target = pathlib.Path('/data')
                 csv_path = mount_target.joinpath('camera_trajectory.csv')
@@ -89,13 +99,13 @@ def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeou
                 json_path = mount_target.joinpath('imu_data.json')
                 mask_path = mount_target.joinpath('slam_mask.png')
                 mask_write_path = video_dir.joinpath('slam_mask.png')
-                
+
                 # find video duration
                 with av.open(str(video_dir.joinpath('raw_video.mp4').absolute())) as container:
                     video = container.streams.video[0]
                     duration_sec = float(video.duration * video.time_base)
                 timeout = duration_sec * timeout_multiple
-                
+
                 slam_mask = np.zeros((2028, 2704), dtype=np.uint8)
                 slam_mask = draw_predefined_mask(
                     slam_mask, color=255, mirror=True, gripper=False, finger=True)
@@ -128,7 +138,7 @@ def main(input_dir, map_path, docker_image, num_workers, max_lost_frames, timeou
 
                 if len(futures) >= num_workers:
                     # limit number of inflight tasks
-                    completed, futures = concurrent.futures.wait(futures, 
+                    completed, futures = concurrent.futures.wait(futures,
                         return_when=concurrent.futures.FIRST_COMPLETED)
                     pbar.update(len(completed))
 
