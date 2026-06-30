@@ -23,7 +23,6 @@ dependencies:
   - zarr=2.16
   - numcodecs=0.11
   - hydra-core=1.2.0
-  - wandb=0.15.8
   - dill=0.3.7
   - einops=0.6.1
   - diffusers=0.18.2
@@ -45,6 +44,12 @@ dependencies:
     - threadpoolctl==3.2
     - v4l2py==2.2
     - ur-rtde==1.5.6
+    - zerorpc==0.6.3
+    - loguru==0.7.3
+    - dynamixel-sdk==3.7.31
+    - wandb==0.26.1
+    - huggingface_hub==0.25.0
+    - pybullet==3.2.7
     # requires apt install libspnav-dev spacenavd; systemctl start spacenavd
     - spnav @ https://github.com/cheng-chi/spnav/archive/c1c938ebe3cc542db4685e0d13850ff1abfdb943.tar.gz
     - atomics==1.0.2
